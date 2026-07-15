@@ -1,0 +1,63 @@
+name: ticket-check
+# Enforces ticket-first at merge time:
+#   (1) the PR must link a ticket ("Closes #N" / "Fixes #N"), and
+#   (2) EVERY non-merge commit in the PR must reference a ticket (#N).
+# Make this a REQUIRED status check in the branch ruleset so a PR cannot merge
+# unless both hold. Works as a required org workflow so new repos are covered too.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+permissions:
+  contents: read
+  pull-requests: read
+jobs:
+  ticket-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: PR links a ticket AND every commit references one
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const num = context.issue.number;
+            const problems = [];
+
+            // (1) PR must link an issue via Closes/Fixes #N
+            const q = `query($owner:String!,$repo:String!,$num:Int!){
+              repository(owner:$owner,name:$repo){
+                pullRequest(number:$num){
+                  closingIssuesReferences(first:10){ nodes{ number state } }
+                }
+              }
+            }`;
+            const r = await github.graphql(q, { owner, repo, num });
+            const linked = r.repository.pullRequest.closingIssuesReferences.nodes;
+            if (!linked.length) {
+              problems.push('• The PR links no ticket. Add "Closes #<issue>" to the description.');
+            }
+
+            // (2) every non-merge commit must reference a ticket (#N)
+            const commits = await github.paginate(github.rest.pulls.listCommits, {
+              owner, repo, pull_number: num, per_page: 100
+            });
+            const bad = [];
+            for (const c of commits) {
+              if ((c.parents || []).length > 1) continue;           // skip merge commits
+              const first = (c.commit.message || '').split('\n')[0];
+              if (!/#\d+/.test(c.commit.message || '')) {
+                bad.push(`${c.sha.slice(0,7)} — ${first.slice(0,60)}`);
+              }
+            }
+            if (bad.length) {
+              problems.push('• These commits have no ticket reference (#N):\n    ' + bad.join('\n    '));
+            }
+
+            if (problems.length) {
+              core.setFailed(
+                'Ticket check failed:\n' + problems.join('\n') +
+                '\n\nEvery commit AND the PR must reference a ticket. No ticket = no merge.\n' +
+                'Fix commits with an interactive rebase/reword, or use squash-merge with a ticket in the title.'
+              );
+            } else {
+              core.info(`OK — PR links #${linked.map(i=>i.number).join(', #')}; all ${commits.length} commit(s) reference a ticket.`);
+            }
